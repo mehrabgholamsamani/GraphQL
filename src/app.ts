@@ -15,6 +15,7 @@ import { AppError } from "./errors.js";
 import { resolvers } from "./graphql/resolvers.js";
 import { typeDefs } from "./graphql/typeDefs.js";
 import { fieldCountLimit } from "./security/queryComplexity.js";
+import { ZodError } from "zod";
 
 export async function createApp(store: InMemoryStore, config: AppConfig) {
   const app = express();
@@ -53,6 +54,18 @@ export async function createApp(store: InMemoryStore, config: AppConfig) {
         return {
           message: originalError.message,
           extensions: { code: originalError.code, http: { status: originalError.statusCode } }
+        };
+      }
+      if (originalError instanceof ZodError) {
+        return {
+          message: "Invalid input",
+          extensions: {
+            code: "BAD_USER_INPUT",
+            issues: originalError.issues.map((issue) => ({
+              path: issue.path.join("."),
+              message: issue.message
+            }))
+          }
         };
       }
       if (config.NODE_ENV === "production" && formattedError.extensions?.code === "INTERNAL_SERVER_ERROR") {

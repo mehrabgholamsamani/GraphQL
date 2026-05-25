@@ -3,7 +3,7 @@ import { z } from "zod";
 import type { RequestContext } from "../context.js";
 import type { ApiScope, Document, Tag } from "../domain/types.js";
 import { badInput, notFound } from "../errors.js";
-import { requireMembership, requireRole, requireScope, requireUser } from "../policies/permissions.js";
+import { requireActorUserId, requireMembership, requireRole, requireScope, requireUser } from "../policies/permissions.js";
 import { randomSecret, sha256 } from "../security/crypto.js";
 import { login, logout, register, rotateRefreshToken } from "../services/authService.js";
 import { writeAudit } from "../services/auditService.js";
@@ -49,13 +49,20 @@ export const resolvers = {
   DateTime: new GraphQLScalarType({
     name: "DateTime",
     serialize(value) {
-      return value instanceof Date ? value.toISOString() : new Date(String(value)).toISOString();
+      const date = value instanceof Date ? value : new Date(String(value));
+      if (Number.isNaN(date.getTime())) throw badInput("Invalid DateTime value");
+      return date.toISOString();
     },
     parseValue(value) {
-      return new Date(String(value));
+      const date = new Date(String(value));
+      if (Number.isNaN(date.getTime())) throw badInput("Invalid DateTime value");
+      return date;
     },
     parseLiteral(ast) {
-      return ast.kind === Kind.STRING ? new Date(ast.value) : null;
+      if (ast.kind !== Kind.STRING) return null;
+      const date = new Date(ast.value);
+      if (Number.isNaN(date.getTime())) throw badInput("Invalid DateTime value");
+      return date;
     }
   }),
 
@@ -115,8 +122,9 @@ export const resolvers = {
         createdAt: ctx.store.now()
       };
       ctx.store.organizations.set(organization.id, organization);
-      ctx.store.memberships.set(ctx.store.id(), {
-        id: ctx.store.id(),
+      const membershipId = ctx.store.id();
+      ctx.store.memberships.set(membershipId, {
+        id: membershipId,
         userId: user.id,
         organizationId: organization.id,
         role: "OWNER",
@@ -126,6 +134,7 @@ export const resolvers = {
       return organization;
     },
     createWorkspace: (_: unknown, args: { input: { organizationId: string; name: string } }, ctx: RequestContext) => {
+      requireUser(ctx);
       requireRole(ctx, args.input.organizationId, "ADMIN");
       const workspace = {
         id: ctx.store.id(),
@@ -138,7 +147,7 @@ export const resolvers = {
       return workspace;
     },
     createDocument: (_: unknown, args: { input: { workspaceId: string; title: string; body: string; tags: string[] } }, ctx: RequestContext) => {
-      const user = requireUser(ctx);
+      const actorUserId = requireActorUserId(ctx);
       const workspace = ctx.store.workspaces.get(args.input.workspaceId);
       if (!workspace) throw notFound();
       requireRole(ctx, workspace.organizationId, "EDITOR");
@@ -151,8 +160,8 @@ export const resolvers = {
         title: nameInput.parse(args.input.title),
         body: textInput.parse(args.input.body),
         tagIds: tags.map((tag) => tag.id),
-        createdById: user.id,
-        updatedById: user.id,
+        createdById: actorUserId,
+        updatedById: actorUserId,
         createdAt: ctx.store.now(),
         updatedAt: ctx.store.now()
       };
@@ -161,7 +170,7 @@ export const resolvers = {
       return document;
     },
     updateDocument: (_: unknown, args: { input: { id: string; title?: string; body?: string; tags?: string[] } }, ctx: RequestContext) => {
-      const user = requireUser(ctx);
+      const actorUserId = requireActorUserId(ctx);
       const document = getDocument(ctx, args.input.id);
       requireRole(ctx, document.organizationId, "EDITOR");
       requireScope(ctx, "documents:write");
@@ -170,7 +179,7 @@ export const resolvers = {
       if (args.input.tags !== undefined) {
         document.tagIds = upsertTags(ctx, document.organizationId, args.input.tags).map((tag) => tag.id);
       }
-      document.updatedById = user.id;
+      document.updatedById = actorUserId;
       document.updatedAt = ctx.store.now();
       writeAudit(ctx, document.organizationId, "document.updated", "Document", document.id);
       return document;
@@ -184,7 +193,7 @@ export const resolvers = {
       return true;
     },
     addComment: (_: unknown, args: { input: { documentId: string; body: string } }, ctx: RequestContext) => {
-      const user = requireUser(ctx);
+      const actorUserId = requireActorUserId(ctx);
       const document = getDocument(ctx, args.input.documentId);
       requireRole(ctx, document.organizationId, "EDITOR");
       requireScope(ctx, "documents:write");
@@ -193,7 +202,7 @@ export const resolvers = {
         organizationId: document.organizationId,
         documentId: document.id,
         body: textInput.parse(args.input.body),
-        createdById: user.id,
+        createdById: actorUserId,
         createdAt: ctx.store.now()
       };
       ctx.store.comments.set(comment.id, comment);
@@ -221,6 +230,7 @@ export const resolvers = {
     revokeApiKey: (_: unknown, args: { id: string }, ctx: RequestContext) => {
       const apiKey = ctx.store.apiKeys.get(args.id);
       if (!apiKey) throw notFound();
+      requireUser(ctx);
       requireRole(ctx, apiKey.organizationId, "ADMIN");
       apiKey.revokedAt = ctx.store.now();
       writeAudit(ctx, apiKey.organizationId, "api_key.revoked", "ApiKey", apiKey.id);

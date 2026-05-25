@@ -18,6 +18,12 @@ export function requireUser(ctx: RequestContext): NonNullable<RequestContext["us
   return ctx.user;
 }
 
+export function requireActorUserId(ctx: RequestContext): string {
+  if (ctx.user) return ctx.user.id;
+  if (ctx.apiKey) return ctx.apiKey.createdById;
+  throw unauthenticated();
+}
+
 export function requireMembership(ctx: RequestContext, organizationId: string): Membership {
   requireActor(ctx);
 
@@ -32,7 +38,7 @@ export function requireMembership(ctx: RequestContext, organizationId: string): 
       id: "api-key-membership",
       userId: ctx.apiKey.createdById,
       organizationId,
-      role: "VIEWER",
+      role: "OWNER",
       createdAt: ctx.apiKey.createdAt
     };
   }

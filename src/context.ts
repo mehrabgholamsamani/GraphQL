@@ -1,4 +1,5 @@
 import type { Request } from "express";
+import { GraphQLError } from "graphql";
 import type { AppConfig } from "./config.js";
 import type { InMemoryStore } from "./database/inMemoryStore.js";
 import type { ApiKey, User } from "./domain/types.js";
@@ -38,7 +39,9 @@ export function createContextFactory(store: InMemoryStore, config: AppConfig) {
         const payload = verifyAccessToken(token, config);
         user = store.users.get(payload.sub);
       } catch {
-        user = undefined;
+        throw new GraphQLError("Authentication required", {
+          extensions: { code: "UNAUTHENTICATED", http: { status: 401 } }
+        });
       }
     }
 

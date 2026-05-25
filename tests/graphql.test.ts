@@ -1,7 +1,7 @@
 import request from "supertest";
 import { describe, expect, it } from "vitest";
 import { createApp } from "../src/app.js";
-import { config } from "../src/config.js";
+import { config, parseConfig } from "../src/config.js";
 import { createStore } from "../src/database/inMemoryStore.js";
 
 async function gql(app: Awaited<ReturnType<typeof createApp>>["app"], query: string, variables?: object, token?: string, apiKey?: string) {
@@ -12,6 +12,38 @@ async function gql(app: Awaited<ReturnType<typeof createApp>>["app"], query: str
 }
 
 describe("secure GraphQL backend", () => {
+  async function seedOwnerWorkspace(runtime: Awaited<ReturnType<typeof createApp>>, email: string) {
+    const registered = await gql(
+      runtime.app,
+      `mutation Register($input: RegisterInput!) {
+        register(input: $input) { accessToken }
+      }`,
+      { input: { email, password: "correct horse battery staple", name: "Owner" } }
+    );
+    const accessToken = registered.body.data.register.accessToken as string;
+
+    const org = await gql(
+      runtime.app,
+      `mutation CreateOrg($input: CreateOrganizationInput!) {
+        createOrganization(input: $input) { id }
+      }`,
+      { input: { name: `${email} org` } },
+      accessToken
+    );
+    const organizationId = org.body.data.createOrganization.id as string;
+
+    const workspace = await gql(
+      runtime.app,
+      `mutation CreateWorkspace($input: CreateWorkspaceInput!) {
+        createWorkspace(input: $input) { id }
+      }`,
+      { input: { organizationId, name: "Security" } },
+      accessToken
+    );
+
+    return { accessToken, organizationId, workspaceId: workspace.body.data.createWorkspace.id as string };
+  }
+
   it("supports auth, tenancy, documents, API keys, and audit logs", async () => {
     const runtime = await createApp(createStore(), { ...config, NODE_ENV: "test", GRAPHQL_INTROSPECTION: true });
 
@@ -85,6 +117,80 @@ describe("secure GraphQL backend", () => {
     expect(logs.body.data.auditLogs.nodes.map((log: { action: string }) => log.action)).toContain("document.created");
 
     await runtime.server.stop();
+  });
+
+  it("allows scoped API keys to write documents but not manage workspaces", async () => {
+    const runtime = await createApp(createStore(), { ...config, NODE_ENV: "test", GRAPHQL_INTROSPECTION: true });
+    const seeded = await seedOwnerWorkspace(runtime, "apikey-writer@example.com");
+
+    const apiKey = await gql(
+      runtime.app,
+      `mutation CreateKey($input: CreateApiKeyInput!) {
+        createApiKey(input: $input) { token }
+      }`,
+      { input: { organizationId: seeded.organizationId, name: "writer", scopes: ["documents_read", "documents_write"] } },
+      seeded.accessToken
+    );
+
+    const created = await gql(
+      runtime.app,
+      `mutation CreateDocument($input: CreateDocumentInput!) {
+        createDocument(input: $input) { id title createdBy { email } }
+      }`,
+      { input: { workspaceId: seeded.workspaceId, title: "API written", body: "Created by scoped API key" } },
+      undefined,
+      apiKey.body.data.createApiKey.token
+    );
+    expect(created.body.data.createDocument.title).toBe("API written");
+    expect(created.body.data.createDocument.createdBy.email).toBe("apikey-writer@example.com");
+
+    const blocked = await gql(
+      runtime.app,
+      `mutation CreateWorkspace($input: CreateWorkspaceInput!) {
+        createWorkspace(input: $input) { id }
+      }`,
+      { input: { organizationId: seeded.organizationId, name: "Blocked" } },
+      undefined,
+      apiKey.body.data.createApiKey.token
+    );
+    expect(blocked.body.errors[0].extensions.code).toBe("UNAUTHENTICATED");
+
+    await runtime.server.stop();
+  });
+
+  it("rejects malformed bearer tokens", async () => {
+    const runtime = await createApp(createStore(), { ...config, NODE_ENV: "test", GRAPHQL_INTROSPECTION: true });
+
+    const response = await gql(runtime.app, `query { me { id } }`, undefined, "not-a-real-token");
+
+    expect(response.body.errors[0].extensions.code).toBe("UNAUTHENTICATED");
+    await runtime.server.stop();
+  });
+
+  it("returns BAD_USER_INPUT for validation errors", async () => {
+    const runtime = await createApp(createStore(), { ...config, NODE_ENV: "test", GRAPHQL_INTROSPECTION: true });
+
+    const response = await gql(
+      runtime.app,
+      `mutation Register($input: RegisterInput!) {
+        register(input: $input) { user { id } }
+      }`,
+      { input: { email: "not-an-email", password: "short", name: "" } }
+    );
+
+    expect(response.body.errors[0].extensions.code).toBe("BAD_USER_INPUT");
+    await runtime.server.stop();
+  });
+
+  it("rejects default JWT secrets in production", () => {
+    expect(() => parseConfig({ NODE_ENV: "production" })).toThrow();
+    expect(() =>
+      parseConfig({
+        NODE_ENV: "production",
+        JWT_ACCESS_SECRET: "replace-this-access-secret-in-prod",
+        JWT_REFRESH_SECRET: "replace-this-refresh-secret-in-prod"
+      })
+    ).not.toThrow();
   });
 
   it("blocks cross-tenant document reads", async () => {
